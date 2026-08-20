@@ -1,0 +1,10 @@
+ Install Python: Download from python.org and check the box "Add Python to PATH".
+
+ Get an Editor: Install VS Code or Cursor, then add the Python and Jupyter extensions.
+
+ Create Environment: Open your project folder, open the terminal, and run: python -m venv .venv
+
+ Activate & Bind: Activate it (.\.venv\Scripts\Activate.ps1) and select it in your editor via Command Palette (Ctrl+Shift+P -> Python: Select Interpreter).
+
+ Install & Code: Run pip install for your packages (like numpy, pandas) and start  
+ this is how i did my work
