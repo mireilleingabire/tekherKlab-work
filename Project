@@ -1,10 +1,17 @@
- Install Python: Download from python.org and check the box "Add Python to PATH".
+# Assignment 1: Python for AI Warm-Up
 
- Get an Editor: Install VS Code or Cursor, then add the Python and Jupyter extensions.
+## Setup & Installation
+1. Create a virtual environment:
+   `python -m venv .venv`
+2. Activate the virtual environment:
+   - Mac/Linux: `source .venv/bin/activate`
+   - Windows: `.venv\Scripts\Activate.ps1`
+3. Install dependencies:
+   `pip install -r requirements.txt`
 
- Create Environment: Open your project folder, open the terminal, and run: python -m venv .venv
-
- Activate & Bind: Activate it (.\.venv\Scripts\Activate.ps1) and select it in your editor via Command Palette (Ctrl+Shift+P -> Python: Select Interpreter).
-
- Install & Code: Run pip install for your packages (like numpy, pandas) and start  
- this is how i did my work
+## How to Run
+1. Open VS Code or Jupyter Notebook inside this folder.
+2. Run the smoke test cell to verify your environment:
+   ```python
+   import numpy, pandas, sklearn, matplotlib
+   print("all good")
