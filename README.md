@@ -1,14 +1,14 @@
-@"
-# 🤖 AI Bootcamp - Assignments Repository
+
+# 🤖 AI Bootcamp
 
 ## 👩‍💻 Author
 **Ingabire Mireille**
+Building AI solutions, one assignment at a time. This repository documents my journey through the AI Bootcamp. From Python fundamentals to AI deployment. Every line of code is a step toward mastery. Learning, building, and growing every day.
 
----
 
 ## 📁 Repository Structure
 
-\`\`\`
+
 tekherKlab-work/
 ├── .venv/                     # Virtual environment (gitignored)
 ├── data/
@@ -22,9 +22,8 @@ tekherKlab-work/
 ├── .gitignore                # Git ignore rules
 ├── README.md                # This file
 └── requirements.txt         # Python dependencies
-\`\`\`
 
----
+
 
 ## 🚀 Quick Setup
 
