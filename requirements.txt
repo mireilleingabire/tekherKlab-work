@@ -11,4 +11,8 @@ plotly
 streamlit
 matplotlib
 torch
+<<<<<<< HEAD
 transformers
+=======
+transformers
+>>>>>>> day02-assignment
