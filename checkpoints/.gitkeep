@@ -1,0 +1,551 @@
+"""
+Customer Segment Classifier — corrected pipeline.
+Key fixes vs. the original are marked with  # FIX n
+"""
+import matplotlib
+matplotlib.use("Agg")  # FIX: headless-safe backend for server rendering
+
+import warnings
+from io import StringIO
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+import seaborn as sns
+import gradio as gr
+from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+
+warnings.filterwarnings("ignore")
+
+RANDOM_STATE = 42
+SEGMENT_ORDER = ["Low", "Medium-Low", "Medium-High", "High"]
+
+# FIX 1: css= takes raw CSS, NOT a <style> block. The original string was
+# injected verbatim into a <style> tag, producing "<style><style>..." so the
+# entire stylesheet was invalid and silently ignored.
+custom_css = """
+.gradio-container { max-width: 1400px !important; margin: 0 auto !important; }
+
+.header-container {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    padding: 2rem 3rem; border-radius: 20px; margin-bottom: 1rem;
+    box-shadow: 0 10px 40px rgba(102,126,234,0.3); text-align: center;
+}
+.header-title {
+    color: #fff !important; font-size: 2.6rem !important; font-weight: 800 !important;
+    margin: 0 !important; letter-spacing: -0.5px !important;
+}
+.header-subtitle {
+    color: rgba(255,255,255,0.95) !important; font-size: 1.1rem !important;
+    margin-top: 0.5rem !important; font-weight: 300 !important;
+}
+/* FIX 2: style a real Gradio container via elem_classes instead of emitting
+   bare <div class="card"> strings that Gradio sanitises into empty divs. */
+.card {
+    border-radius: 16px !important; padding: 1.25rem !important;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.06) !important;
+    border: 1px solid rgba(128,128,128,0.18) !important;
+}
+.metric-grid {
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)) !important;
+    gap: 1rem !important; margin: 1rem 0 !important;
+}
+.metric-card {
+    background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%) !important;
+    padding: 1.25rem !important; border-radius: 12px !important; text-align: center !important;
+}
+.metric-value { font-size: 2rem !important; font-weight: 700 !important; color: #2d3748 !important; margin: 0 !important; }
+.metric-label {
+    font-size: 0.8rem !important; color: #4a5568 !important; margin-top: 0.3rem !important;
+    font-weight: 600 !important; text-transform: uppercase !important; letter-spacing: 0.5px !important;
+}
+.result-container { padding: 1.5rem !important; border-radius: 16px !important; margin: 0.5rem 0 !important; text-align: center !important; }
+.result-high        { background: linear-gradient(135deg, #00b09b, #96c93d) !important; }
+.result-medium-high { background: linear-gradient(135deg, #f7971e, #ffd200) !important; }
+.result-medium-low  { background: linear-gradient(135deg, #fbb034, #ffdd00) !important; }
+.result-low         { background: linear-gradient(135deg, #e44d26, #f16529) !important; }
+.result-text { color: #fff !important; font-size: 2.2rem !important; font-weight: 800 !important; margin: 0 !important; }
+.result-subtext { color: rgba(255,255,255,0.92) !important; font-size: 1rem !important; margin-top: 0.4rem !important; }
+.dataset-info { background: rgba(102,126,234,0.08); border-radius: 12px; padding: 1rem; margin: 1rem 0; border-left: 4px solid #667eea; }
+.pipeline-step { display: inline-block; padding: 0.3rem 1rem; margin: 0.2rem; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
+.step-load { background: #667eea; color: #fff; }
+.step-preprocess { background: #764ba2; color: #fff; }
+.step-train { background: #f093fb; color: #fff; }
+.step-evaluate { background: #43e97b; color: #1a202c; }
+.footer { text-align: center !important; padding: 1.5rem !important; opacity: 0.7; font-size: 0.9rem !important; }
+@media (max-width: 768px) {
+    .header-title { font-size: 1.8rem !important; }
+    .metric-grid { grid-template-columns: 1fr 1fr !important; }
+    .result-text { font-size: 1.6rem !important; }
+}
+"""
+
+# The exact schema the UI collects. Everything downstream is pinned to this
+# order so the scaler/model never see mismatched columns.  # FIX 3
+UI_NUMERIC = ["age", "annual_income", "spending_score", "work_experience", "family_size"]
+UI_CATEGORICAL = ["gender", "profession"]
+UI_FEATURES = UI_NUMERIC + UI_CATEGORICAL
+PROFESSIONS = ["Engineer", "Doctor", "Teacher", "Business", "Student", "Retired"]
+GENDERS = ["Male", "Female"]
+
+
+# ============================================
+# STEP 1: LOAD
+# ============================================
+def score_to_segment(income, spending, experience, age):
+    score = 0
+    score += 3 if income > 90000 else 2 if income > 60000 else 1 if income > 35000 else 0
+    score += 3 if spending > 80 else 2 if spending > 60 else 1 if spending > 40 else 0
+    score += 1 if experience > 15 else 0
+    score += 1 if 25 <= age <= 45 else 0
+    return "High" if score >= 7 else "Medium-High" if score >= 5 else "Medium-Low" if score >= 3 else "Low"
+
+
+def generate_synthetic_data(n=2000):
+    rng = np.random.default_rng(RANDOM_STATE)
+    df = pd.DataFrame({
+        "age": rng.integers(18, 71, n),
+        "annual_income": rng.integers(20000, 150001, n),
+        "spending_score": rng.integers(1, 101, n),
+        "work_experience": rng.integers(0, 41, n),
+        "family_size": rng.integers(1, 9, n),
+        "gender": rng.choice(GENDERS, n),
+        "profession": rng.choice(PROFESSIONS, n),
+    })
+    # FIX 4: vectorised instead of a 2000-iteration .loc loop
+    df["segment"] = [
+        score_to_segment(i, s, w, a)
+        for i, s, w, a in zip(df.annual_income, df.spending_score, df.work_experience, df.age)
+    ]
+    return df
+
+
+def load_dataset():
+    """Fetch a remote dataset, else fall back to synthetic data.
+
+    FIX 5: the original swallowed every error with a bare `except: continue`
+    and, worse, an outer try/except that could return None. It also had no way
+    of telling the caller which source actually won.
+    """
+    urls = [
+        "https://raw.githubusercontent.com/arifshariati/customer-segmentation-dataset/main/Train.csv",
+        "https://raw.githubusercontent.com/sakshipatil1096/Customer-Segmentation/master/train.csv",
+        "https://raw.githubusercontent.com/ajaymache/Mall_Customer_Segmentation/master/Mall_Customers.csv",
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            df = pd.read_csv(StringIO(resp.text))
+            if not df.empty:
+                print(f"   Loaded remote dataset: {url}")
+                return df, url
+        except Exception as exc:
+            print(f"   Source unavailable ({type(exc).__name__}): {url}")
+    print("   All remote sources unavailable -> using synthetic dataset")
+    return generate_synthetic_data(), "synthetic"
+
+
+# ============================================
+# STEP 2: PREPROCESS
+# ============================================
+def preprocess_data(df):
+    print("\nSTEP 2: Preprocessing")
+    df = df.copy()
+    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
+
+    rename = {
+        "annual_income_($)": "annual_income", "annual_income_(k$)": "annual_income",
+        "spending_score_(1-100)": "spending_score", "spending_score_(1_100)": "spending_score",
+        "genre": "gender", "ever_married": "married", "graduated": "graduated",
+        "var_1": "var_1", "work_experience": "work_experience", "family_size": "family_size",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    for col in ["id", "customer_id", "customerid", "unnamed:_0", "index"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
+            print(f"   Dropped: {col}")
+
+    # FIX 6: df.median() on a frame containing strings raises TypeError.
+    # Impute numerics with median and categoricals with the mode, separately.
+    num_cols = df.select_dtypes(include=np.number).columns
+    cat_cols = df.select_dtypes(exclude=np.number).columns
+    if len(num_cols):
+        df[num_cols] = df[num_cols].fillna(df[num_cols].median())
+    for col in cat_cols:
+        if df[col].isna().any():
+            mode = df[col].mode()
+            df[col] = df[col].fillna(mode.iloc[0] if not mode.empty else "Unknown")
+    print("   Missing values imputed (median / mode)")
+
+    if "segment" in df.columns:
+        # FIX 7: on a Categorical column .map() then .fillna() raises; cast to
+        # object first. Also a mixed str/int mapping dict never matched ints.
+        df["segment"] = df["segment"].astype(str).str.strip()
+        mapping = {"A": "High", "B": "Medium-High", "C": "Medium-Low", "D": "Low",
+                   "0": "Low", "1": "Medium-Low", "2": "Medium-High", "3": "High"}
+        df["segment"] = df["segment"].map(mapping).fillna(df["segment"])
+    elif {"annual_income", "spending_score"}.issubset(df.columns):
+        print("   Deriving 'segment' from income + spending")
+        df["segment"] = [
+            score_to_segment(i, s, w, a)
+            for i, s, w, a in zip(
+                df["annual_income"], df["spending_score"],
+                df.get("work_experience", pd.Series(0, index=df.index)),
+                df.get("age", pd.Series(30, index=df.index)),
+            )
+        ]
+    else:
+        raise ValueError("Dataset has no 'segment' column and no income/spending to derive one.")
+
+    df = df.dropna(subset=["segment"])
+    print(f"   Shape: {df.shape} | Segments: {sorted(df['segment'].unique())}")
+    return df
+
+
+# ============================================
+# STEP 3: ENCODE & SCALE
+# ============================================
+def encode_and_scale(df):
+    print("\nSTEP 3: Encoding & scaling")
+    df = df.copy()
+
+    # FIX 8: pin training features to exactly what the UI can supply, so the
+    # scaler and model are never asked for a column the form cannot produce.
+    feature_cols = [c for c in UI_FEATURES if c in df.columns]
+    missing = [c for c in UI_FEATURES if c not in df.columns]
+    for col in missing:
+        default = 0 if col in UI_NUMERIC else ("Male" if col == "gender" else "Engineer")
+        df[col] = default
+        print(f"   Column '{col}' absent in source -> filled with default {default!r}")
+    feature_cols = UI_FEATURES
+
+    encoders = {}
+    for col in UI_CATEGORICAL:
+        allowed = GENDERS if col == "gender" else PROFESSIONS
+        # FIX 9: fit the encoder on the full allowed vocabulary, so a dropdown
+        # choice absent from the CSV cannot blow up transform() at predict time.
+        df[col] = df[col].astype(str).where(df[col].astype(str).isin(allowed), allowed[0])
+        enc = LabelEncoder().fit(allowed)
+        df[col] = enc.transform(df[col])
+        encoders[col] = enc
+        print(f"   Encoded {col}: {list(enc.classes_)}")
+
+    seg_present = [s for s in SEGMENT_ORDER if s in set(df["segment"])]
+    target_enc = LabelEncoder().fit(seg_present)  # FIX 10: stable, ordered classes
+    y = pd.Series(target_enc.transform(df["segment"]), index=df.index)
+    encoders["segment"] = target_enc
+
+    X = df[feature_cols].astype(float)
+    scaler = StandardScaler().fit(X)          # FIX 11: keep a DataFrame so
+    X_scaled = scaler.transform(X)            # feature names are recorded once,
+    print(f"   Scaled {len(feature_cols)} features: {feature_cols}")
+    return X_scaled, y, encoders, scaler, feature_cols
+
+
+# ============================================
+# STEP 4: TRAIN
+# ============================================
+def train_model(X, y, feature_cols):  # FIX 12: feature_cols passed in, not read
+    print("\nSTEP 4: Training")                     # from a module-level global
+    counts = y.value_counts()
+    stratify = y if counts.min() >= 2 else None
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=stratify
+    )
+    model = DecisionTreeClassifier(
+        max_depth=8, min_samples_split=10, min_samples_leaf=5,
+        class_weight="balanced", random_state=RANDOM_STATE,
+    ).fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    importance = (pd.DataFrame({"Feature": feature_cols, "Importance": model.feature_importances_})
+                  .sort_values("Importance", ascending=False).reset_index(drop=True))
+    cm = confusion_matrix(y_test, y_pred, labels=np.arange(len(np.unique(y))))
+    print(f"   Train {X_train.shape[0]} / Test {X_test.shape[0]} | Accuracy {acc:.2%}")
+    print(f"   Top feature: {importance.iloc[0].Feature} ({importance.iloc[0].Importance:.1%})")
+    return model, X_test, y_test, y_pred, acc, importance, cm
+
+
+# ============================================
+# PIPELINE
+# ============================================
+print("=" * 52)
+print("STARTING CUSTOMER SEGMENTATION PIPELINE")
+print("=" * 52)
+print("\nSTEP 1: Loading dataset")
+raw_df, source = load_dataset()
+print(f"   {len(raw_df)} records from {source}")
+
+df = preprocess_data(raw_df)
+segment_counts = df["segment"].value_counts()          # FIX 13: captured once
+X_scaled, y, encoders, scaler, feature_cols = encode_and_scale(df)
+model, X_test, y_test, y_pred, accuracy, importance, cm = train_model(X_scaled, y, feature_cols)
+
+dataset_size = len(df)
+num_features = len(feature_cols)
+class_names = list(encoders["segment"].classes_)
+num_segments = len(class_names)
+print("\n" + "=" * 52 + "\nPIPELINE COMPLETE\n" + "=" * 52)
+
+
+# ============================================
+# PREDICTION
+# ============================================
+def predict_customer(age, annual_income, spending_score, work_experience,
+                     family_size, gender, profession):
+    try:
+        row = {
+            "age": float(age), "annual_income": float(annual_income),
+            "spending_score": float(spending_score), "work_experience": float(work_experience),
+            "family_size": float(family_size), "gender": gender, "profession": profession,
+        }
+        # FIX 14: build in the exact training column order
+        input_df = pd.DataFrame([row])[feature_cols]
+        for col in UI_CATEGORICAL:
+            input_df[col] = encoders[col].transform(input_df[col].astype(str))
+        input_df = input_df.astype(float)
+
+        proba = model.predict_proba(scaler.transform(input_df))[0]
+        idx = int(np.argmax(proba))
+        # FIX 15: inverse_transform takes encoded INTEGERS. The original passed
+        # class label strings back in, which raises "previously unseen labels".
+        segment = encoders["segment"].inverse_transform([model.classes_[idx]])[0]
+        probs = {encoders["segment"].inverse_transform([c])[0]: float(p)
+                 for c, p in zip(model.classes_, proba)}
+        probs = dict(sorted(probs.items(), key=lambda kv: kv[1], reverse=True))
+        return segment, probs
+    except Exception as exc:
+        return f"Error: {exc}", {}
+
+
+# ============================================
+# PLOTS
+# ============================================
+PALETTE = ["#667eea", "#764ba2", "#f093fb", "#f5576c", "#4facfe", "#43e97b", "#f9d423"]
+
+
+def create_feature_importance_plot():
+    fig, ax = plt.subplots(figsize=(9, 5))
+    s = importance.sort_values("Importance")
+    ax.barh(s["Feature"], s["Importance"], color=PALETTE[:len(s)])
+    ax.set_xlabel("Importance", fontweight="600")
+    ax.set_title("Feature Importance", fontweight="bold")
+    ax.set_xlim(0, max(s["Importance"].max() * 1.18, 0.01))
+    ax.grid(axis="x", alpha=0.2)
+    for i, v in enumerate(s["Importance"]):
+        ax.text(v + s["Importance"].max() * 0.02, i, f"{v:.1%}", va="center", fontweight="bold", fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
+def create_confusion_matrix():
+    fig, ax = plt.subplots(figsize=(7, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names,
+                yticklabels=class_names, ax=ax, cbar_kws={"label": "Count"})
+    ax.set_xlabel("Predicted", fontweight="600")
+    ax.set_ylabel("Actual", fontweight="600")
+    ax.set_title("Confusion Matrix", fontweight="bold")
+    fig.tight_layout()
+    return fig
+
+
+def create_decision_tree():
+    fig, ax = plt.subplots(figsize=(18, 9))
+    plot_tree(model, feature_names=feature_cols, class_names=class_names, filled=True,
+              rounded=True, max_depth=3, ax=ax, fontsize=8, proportion=True)
+    ax.set_title("Decision Tree (first 3 levels)", fontweight="bold")
+    fig.tight_layout()
+    return fig
+
+
+def create_data_distribution():
+    # FIX 16: the original re-downloaded and re-preprocessed the whole dataset
+    # on every render. Reuse the counts computed during the pipeline.
+    fig, ax = plt.subplots(figsize=(7, 5))
+    colors = {"High": "#96c93d", "Medium-High": "#ffd200",
+              "Medium-Low": "#fbb034", "Low": "#f16529"}
+    ordered = [s for s in SEGMENT_ORDER if s in segment_counts.index]
+    vals = [segment_counts[s] for s in ordered]
+    ax.pie(vals, labels=ordered, autopct="%1.1f%%",
+           colors=[colors.get(s, "#667eea") for s in ordered], startangle=90)
+    ax.set_title("Customer Segment Distribution", fontweight="bold")
+    fig.tight_layout()
+    return fig
+
+
+# ============================================
+# RESULT HTML
+# ============================================
+EMOJI = {"High": "🌟", "Medium-High": "⭐", "Medium-Low": "📌", "Low": "📍"}
+CLASS_MAP = {"High": "result-high", "Medium-High": "result-medium-high",
+             "Medium-Low": "result-medium-low", "Low": "result-low"}
+BAR_COLOR = {"High": "#00b09b", "Medium-High": "#f7971e",
+             "Medium-Low": "#fbb034", "Low": "#e44d26"}
+DESC = {"High": "Premium customer with high spending and income potential",
+        "Medium-High": "Valuable customer with good spending habits",
+        "Medium-Low": "Moderate customer with room to grow",
+        "Low": "Budget-conscious customer with lower spending"}
+
+
+def format_result(segment, probs):
+    if not probs:
+        return (f'<div class="result-container result-low">'
+                f'<p class="result-text">⚠️ Error</p>'
+                f'<p class="result-subtext">{segment}</p></div>')
+
+    bars = "".join(
+        f'<div style="margin:0.5rem 0;">'
+        f'<div style="display:flex;justify-content:space-between;font-size:0.9rem;color:#fff;">'
+        f'<span>{EMOJI.get(s, "")} {s}</span><span>{p*100:.1f}%</span></div>'
+        f'<div style="height:8px;background:rgba(255,255,255,0.35);border-radius:4px;overflow:hidden;">'
+        f'<div style="height:100%;width:{p*100:.1f}%;background:{BAR_COLOR.get(s, "#667eea")};'
+        f'border-radius:4px;"></div></div></div>'
+        for s, p in probs.items()
+    )
+    return f"""
+    <div class="result-container {CLASS_MAP.get(segment, '')}">
+        <p class="result-text">{EMOJI.get(segment, '')} {segment}</p>
+        <p class="result-subtext">{DESC.get(segment, '')}</p>
+        <div style="margin-top:1.25rem;background:rgba(0,0,0,0.15);border-radius:12px;padding:1.25rem;">
+            <div style="color:#fff;font-weight:600;margin-bottom:0.5rem;text-align:left;">📊 Probability Distribution</div>
+            {bars}
+            <div style="margin-top:0.6rem;padding-top:0.6rem;border-top:1px solid rgba(255,255,255,0.3);text-align:left;">
+                <span style="color:#fff;font-size:0.9rem;">✓ Confidence: {max(probs.values())*100:.1f}%</span>
+            </div>
+        </div>
+    </div>
+    """
+
+
+# ============================================
+# INTERFACE
+# ============================================
+def create_interface():
+    with gr.Blocks(theme=gr.themes.Soft(), css=custom_css, title="Customer Segment Classifier") as demo:
+        gr.HTML("""
+        <div class="header-container">
+            <h1 class="header-title">🎯 Customer Segment Classifier</h1>
+            <p class="header-subtitle">Load → Preprocess → Train → Predict</p>
+        </div>""")
+
+        gr.HTML("""
+        <div style="text-align:center;margin:0.5rem 0;">
+            <span class="pipeline-step step-load">📥 1. Load</span> →
+            <span class="pipeline-step step-preprocess">🔧 2. Preprocess</span> →
+            <span class="pipeline-step step-train">🤖 3. Train</span> →
+            <span class="pipeline-step step-evaluate">📊 4. Evaluate</span>
+        </div>""")
+
+        gr.HTML(f"""
+        <div class="dataset-info">
+            ✅ <strong>Dataset ready</strong> — source: <code>{source}</code><br>
+            📊 {dataset_size} records &nbsp;|&nbsp; 🎯 {num_segments} segments &nbsp;|&nbsp; 📈 {num_features} features
+        </div>""")
+
+        gr.HTML(f"""
+        <div class="metric-grid">
+            <div class="metric-card"><p class="metric-value">{accuracy:.1%}</p><p class="metric-label">Test Accuracy</p></div>
+            <div class="metric-card"><p class="metric-value">{num_segments}</p><p class="metric-label">Segments</p></div>
+            <div class="metric-card"><p class="metric-value">{num_features}</p><p class="metric-label">Features</p></div>
+            <div class="metric-card"><p class="metric-value">{dataset_size}</p><p class="metric-label">Records</p></div>
+        </div>""")
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                # FIX 17: elem_classes on a real Column, replacing the unclosed
+                # gr.HTML('<div class="card">') / gr.HTML('</div>') sandwich.
+                with gr.Column(elem_classes="card"):
+                    gr.Markdown("### 🔮 Customer Details")
+                    age = gr.Slider(18, 70, value=35, step=1, label="Age")
+                    annual_income = gr.Slider(20000, 150000, value=75000, step=1000, label="Annual Income ($)")
+                    spending_score = gr.Slider(1, 100, value=65, step=1, label="Spending Score (1-100)")
+                    work_experience = gr.Slider(0, 40, value=10, step=1, label="Work Experience (years)")
+                    family_size = gr.Slider(1, 8, value=3, step=1, label="Family Size")
+                    gender = gr.Dropdown(GENDERS, value="Male", label="Gender")
+                    profession = gr.Dropdown(PROFESSIONS, value="Engineer", label="Profession")
+
+                inputs = [age, annual_income, spending_score, work_experience,
+                          family_size, gender, profession]
+
+                with gr.Column(elem_classes="card"):
+                    gr.Markdown("### 💡 Quick Examples")
+                    presets = {
+                        "🌟 High Value": [28, 95000, 85, 12, 4, "Male", "Engineer"],
+                        "⭐ Medium-High": [45, 65000, 60, 20, 3, "Female", "Teacher"],
+                        # FIX 19: the original "Medium-Low" preset actually
+                        # scores as Low; these values genuinely land in-segment.
+                        "📌 Medium-Low": [40, 45000, 45, 10, 3, "Female", "Teacher"],
+                        "📍 Low Value": [62, 30000, 25, 35, 2, "Male", "Retired"],
+                    }
+                    items = list(presets.items())
+                    for pair in (items[:2], items[2:]):
+                        with gr.Row():
+                            for label, vals in pair:
+                                # FIX 18: bind vals via a default arg, otherwise
+                                # every lambda closes over the last loop value.
+                                gr.Button(label, size="sm").click(
+                                    lambda v=vals: v, outputs=inputs
+                                )
+
+                predict_btn = gr.Button("🚀 Predict Segment", variant="primary")
+
+            with gr.Column(scale=1):
+                with gr.Column(elem_classes="card"):
+                    gr.Markdown("### 📊 Prediction Results")
+                    segment_output = gr.HTML()
+                    probabilities_output = gr.JSON(label="Segment Probabilities")
+
+        with gr.Row():
+            with gr.Column(elem_classes="card"):
+                gr.Markdown("### 📈 Feature Importance")
+                gr.Plot(create_feature_importance_plot)
+            with gr.Column(elem_classes="card"):
+                gr.Markdown("### 🎯 Confusion Matrix")
+                gr.Plot(create_confusion_matrix)
+
+        with gr.Row():
+            with gr.Column(elem_classes="card"):
+                gr.Markdown("### 🌳 Decision Tree")
+                gr.Plot(create_decision_tree)
+            with gr.Column(elem_classes="card"):
+                gr.Markdown("### 📊 Segment Distribution")
+                gr.Plot(create_data_distribution)
+
+        gr.HTML(f"""
+        <div class="card" style="margin-top:1rem;">
+            <h3 style="margin-top:0;">📋 Model Information</h3>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+                <div>
+                    <p><strong>Algorithm:</strong> Decision Tree Classifier</p>
+                    <p><strong>Max Depth:</strong> 8 &nbsp;|&nbsp; <strong>Min Split:</strong> 10 &nbsp;|&nbsp; <strong>Min Leaf:</strong> 5</p>
+                    <p><strong>Class Weight:</strong> balanced</p>
+                </div>
+                <div>
+                    <p><strong>Features ({num_features}):</strong> {', '.join(feature_cols)}</p>
+                    <p><strong>Segments:</strong> {', '.join(class_names)}</p>
+                    <p><strong>Held-out Accuracy:</strong> {accuracy:.1%}</p>
+                </div>
+            </div>
+        </div>""")
+
+        gr.HTML('<div class="footer"><p>Built with Gradio · Load → Preprocess → Train → Predict</p></div>')
+
+        def handle_prediction(*args):
+            segment, probs = predict_customer(*args)
+            return format_result(segment, probs), probs
+
+        predict_btn.click(handle_prediction, inputs=inputs,
+                          outputs=[segment_output, probabilities_output])
+    return demo
+
+
+if __name__ == "__main__":
+    create_interface().launch(server_name="0.0.0.0", server_port=7860)
